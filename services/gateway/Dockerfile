@@ -61,6 +61,7 @@ COPY src ./src
 
 ENV PORT=8080
 ENV HEALTH_PORT=8081
+ENV HOME=/tmp/moltbot-state
 ENV MOLTBOT_STATE_DIR=/tmp/moltbot-state/.moltbot
 ENV MOLTBOT_WORKSPACE_DIR=/tmp/moltbot-state/workspace
 EXPOSE 8080 8081

@@ -369,6 +369,7 @@ function runCmd(cmd, args, opts = {}) {
       ...opts,
       env: {
         ...process.env,
+        HOME: "/tmp/moltbot-state",
         MOLTBOT_STATE_DIR: STATE_DIR,
         MOLTBOT_WORKSPACE_DIR: WORKSPACE_DIR,
       },
