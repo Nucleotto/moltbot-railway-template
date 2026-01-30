@@ -1,0 +1,25 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {},
+  "deploy": {},
+  "services": {
+    "gateway": {
+      "source": {
+        "repo": "Nucleotto/moltbot-railway-template",
+        "rootDirectory": "services/gateway"
+      },
+      "volumes": {
+        "/data": "moltbot-data"
+      }
+    },
+    "setup": {
+      "source": {
+        "repo": "Nucleotto/moltbot-railway-template",
+        "rootDirectory": "services/setup"
+      },
+      "volumes": {
+        "/data": "moltbot-data"
+      }
+    }
+  }
+}
