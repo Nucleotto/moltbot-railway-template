@@ -25,15 +25,16 @@ import { Readable } from "node:stream";
 
 export class S3Storage {
   constructor(options = {}) {
-    this.bucket = options.bucket || process.env.AWS_S3_BUCKET_NAME || process.env.S3_BUCKET;
+    // Use RAILWAY_S3_* to avoid AWS SDK auto-detecting credentials for other services (like Bedrock)
+    this.bucket = options.bucket || process.env.RAILWAY_S3_BUCKET || process.env.AWS_S3_BUCKET_NAME || process.env.S3_BUCKET;
     this.prefix = options.prefix || process.env.S3_PREFIX || "moltbot/";
     this.localDir = options.localDir || process.env.MOLTBOT_STATE_DIR || "/tmp/moltbot-state";
     
-    // Railway Object Storage uses AWS-style env vars
-    const endpoint = options.endpoint || process.env.AWS_ENDPOINT_URL || process.env.S3_ENDPOINT;
-    const region = options.region || process.env.AWS_DEFAULT_REGION || process.env.S3_REGION || "auto";
-    const accessKeyId = options.accessKeyId || process.env.AWS_ACCESS_KEY_ID || process.env.S3_ACCESS_KEY_ID;
-    const secretAccessKey = options.secretAccessKey || process.env.AWS_SECRET_ACCESS_KEY || process.env.S3_SECRET_ACCESS_KEY;
+    // Railway Object Storage credentials - use RAILWAY_S3_* to not conflict with AWS SDK defaults
+    const endpoint = options.endpoint || process.env.RAILWAY_S3_ENDPOINT || process.env.AWS_ENDPOINT_URL || process.env.S3_ENDPOINT;
+    const region = options.region || process.env.RAILWAY_S3_REGION || process.env.AWS_DEFAULT_REGION || process.env.S3_REGION || "auto";
+    const accessKeyId = options.accessKeyId || process.env.RAILWAY_S3_ACCESS_KEY_ID || process.env.S3_ACCESS_KEY_ID;
+    const secretAccessKey = options.secretAccessKey || process.env.RAILWAY_S3_SECRET_ACCESS_KEY || process.env.S3_SECRET_ACCESS_KEY;
     
     // Log configuration for debugging
     console.log(`[s3] Initializing S3Storage:`);
