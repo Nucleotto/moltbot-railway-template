@@ -12,7 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import express from "express";
-import { initStorage, getStorage } from "../shared/s3-storage.js";
+import { initStorage, getStorage } from "./s3-storage.js";
 
 const PORT = Number.parseInt(process.env.PORT ?? "8080", 10);
 

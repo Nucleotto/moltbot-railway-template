@@ -15,7 +15,7 @@ import path from "node:path";
 import express from "express";
 import httpProxy from "http-proxy";
 import * as tar from "tar";
-import { initStorage, getStorage } from "../shared/s3-storage.js";
+import { initStorage, getStorage } from "./s3-storage.js";
 
 const PORT = Number.parseInt(process.env.PORT ?? "8080", 10);
 
