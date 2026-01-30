@@ -28,7 +28,8 @@ export class S3Storage {
     // Use RAILWAY_S3_* to avoid AWS SDK auto-detecting credentials for other services (like Bedrock)
     this.bucket = options.bucket || process.env.RAILWAY_S3_BUCKET || process.env.AWS_S3_BUCKET_NAME || process.env.S3_BUCKET;
     this.prefix = options.prefix || process.env.S3_PREFIX || "moltbot/";
-    this.localDir = options.localDir || process.env.MOLTBOT_STATE_DIR || "/tmp/moltbot-state";
+    // Use HOME as base - moltbot writes to $HOME/.moltbot/
+    this.localDir = options.localDir || process.env.HOME || "/data";
     
     // Railway Object Storage credentials - use RAILWAY_S3_* to not conflict with AWS SDK defaults
     const endpoint = options.endpoint || process.env.RAILWAY_S3_ENDPOINT || process.env.AWS_ENDPOINT_URL || process.env.S3_ENDPOINT;

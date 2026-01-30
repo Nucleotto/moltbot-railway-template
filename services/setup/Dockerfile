@@ -61,9 +61,6 @@ RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /moltbot/dist/entry.js "$@"' 
 COPY src ./src
 
 ENV PORT=8080
-ENV HOME=/tmp/moltbot-state
-ENV MOLTBOT_STATE_DIR=/tmp/moltbot-state/.moltbot
-ENV MOLTBOT_WORKSPACE_DIR=/tmp/moltbot-state/workspace
 EXPOSE 8080
 
 CMD ["node", "src/server.js"]
