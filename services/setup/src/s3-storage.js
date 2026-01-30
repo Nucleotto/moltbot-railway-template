@@ -58,7 +58,7 @@ export class S3Storage {
         accessKeyId,
         secretAccessKey,
       },
-      forcePathStyle: true, // Required for most S3-compatible services
+      forcePathStyle: false, // Railway uses virtual-hosted-style URLs
     });
     
     // Ensure prefix ends with /
