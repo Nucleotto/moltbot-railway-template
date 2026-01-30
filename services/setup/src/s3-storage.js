@@ -32,13 +32,31 @@ export class S3Storage {
     // Railway Object Storage uses AWS-style env vars
     const endpoint = options.endpoint || process.env.AWS_ENDPOINT_URL || process.env.S3_ENDPOINT;
     const region = options.region || process.env.AWS_DEFAULT_REGION || process.env.S3_REGION || "auto";
+    const accessKeyId = options.accessKeyId || process.env.AWS_ACCESS_KEY_ID || process.env.S3_ACCESS_KEY_ID;
+    const secretAccessKey = options.secretAccessKey || process.env.AWS_SECRET_ACCESS_KEY || process.env.S3_SECRET_ACCESS_KEY;
+    
+    // Log configuration for debugging
+    console.log(`[s3] Initializing S3Storage:`);
+    console.log(`[s3]   bucket: ${this.bucket || "(not set)"}`);
+    console.log(`[s3]   prefix: ${this.prefix}`);
+    console.log(`[s3]   endpoint: ${endpoint || "(not set)"}`);
+    console.log(`[s3]   region: ${region}`);
+    console.log(`[s3]   accessKeyId: ${accessKeyId ? accessKeyId.slice(0, 8) + "..." : "(not set)"}`);
+    console.log(`[s3]   secretAccessKey: ${secretAccessKey ? "***" : "(not set)"}`);
+    
+    if (!this.bucket) {
+      console.error(`[s3] WARNING: No S3 bucket configured! Set AWS_S3_BUCKET_NAME env var.`);
+    }
+    if (!endpoint) {
+      console.error(`[s3] WARNING: No S3 endpoint configured! Set AWS_ENDPOINT_URL env var.`);
+    }
     
     this.client = new S3Client({
       endpoint,
       region,
       credentials: {
-        accessKeyId: options.accessKeyId || process.env.AWS_ACCESS_KEY_ID || process.env.S3_ACCESS_KEY_ID,
-        secretAccessKey: options.secretAccessKey || process.env.AWS_SECRET_ACCESS_KEY || process.env.S3_SECRET_ACCESS_KEY,
+        accessKeyId,
+        secretAccessKey,
       },
       forcePathStyle: true, // Required for most S3-compatible services
     });
