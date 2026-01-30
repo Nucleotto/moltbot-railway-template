@@ -11,11 +11,11 @@
       "variables": {
         "PORT": "8080",
         "HEALTH_PORT": "8081",
-        "S3_BUCKET": "${{objectstorage.BUCKET_NAME}}",
-        "S3_ENDPOINT": "${{objectstorage.BUCKET_HOST}}",
-        "S3_ACCESS_KEY_ID": "${{objectstorage.ACCESS_KEY_ID}}",
-        "S3_SECRET_ACCESS_KEY": "${{objectstorage.SECRET_ACCESS_KEY}}",
-        "S3_REGION": "${{objectstorage.REGION}}",
+        "AWS_ACCESS_KEY_ID": "${{molbot-data.ACCESS_KEY_ID}}",
+        "AWS_DEFAULT_REGION": "${{molbot-data.REGION}}",
+        "AWS_ENDPOINT_URL": "${{molbot-data.ENDPOINT}}",
+        "AWS_S3_BUCKET_NAME": "${{molbot-data.BUCKET}}",
+        "AWS_SECRET_ACCESS_KEY": "${{molbot-data.SECRET_ACCESS_KEY}}",
         "S3_PREFIX": "moltbot/",
         "S3_SYNC_INTERVAL_MS": "30000"
       }
@@ -29,16 +29,13 @@
         "PORT": "8080",
         "GATEWAY_URL": "http://gateway.railway.internal:8080",
         "GATEWAY_INTERNAL_PORT": "8080",
-        "S3_BUCKET": "${{objectstorage.BUCKET_NAME}}",
-        "S3_ENDPOINT": "${{objectstorage.BUCKET_HOST}}",
-        "S3_ACCESS_KEY_ID": "${{objectstorage.ACCESS_KEY_ID}}",
-        "S3_SECRET_ACCESS_KEY": "${{objectstorage.SECRET_ACCESS_KEY}}",
-        "S3_REGION": "${{objectstorage.REGION}}",
+        "AWS_ACCESS_KEY_ID": "${{molbot-data.ACCESS_KEY_ID}}",
+        "AWS_DEFAULT_REGION": "${{molbot-data.REGION}}",
+        "AWS_ENDPOINT_URL": "${{molbot-data.ENDPOINT}}",
+        "AWS_S3_BUCKET_NAME": "${{molbot-data.BUCKET}}",
+        "AWS_SECRET_ACCESS_KEY": "${{molbot-data.SECRET_ACCESS_KEY}}",
         "S3_PREFIX": "moltbot/"
       }
-    },
-    "objectstorage": {
-      "type": "object-storage"
     }
   }
 }

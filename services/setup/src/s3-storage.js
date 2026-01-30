@@ -25,20 +25,20 @@ import { Readable } from "node:stream";
 
 export class S3Storage {
   constructor(options = {}) {
-    this.bucket = options.bucket || process.env.S3_BUCKET;
+    this.bucket = options.bucket || process.env.AWS_S3_BUCKET_NAME || process.env.S3_BUCKET;
     this.prefix = options.prefix || process.env.S3_PREFIX || "moltbot/";
     this.localDir = options.localDir || process.env.MOLTBOT_STATE_DIR || "/tmp/moltbot-state";
     
-    // Railway Object Storage uses S3-compatible API
-    const endpoint = options.endpoint || process.env.S3_ENDPOINT;
-    const region = options.region || process.env.S3_REGION || "auto";
+    // Railway Object Storage uses AWS-style env vars
+    const endpoint = options.endpoint || process.env.AWS_ENDPOINT_URL || process.env.S3_ENDPOINT;
+    const region = options.region || process.env.AWS_DEFAULT_REGION || process.env.S3_REGION || "auto";
     
     this.client = new S3Client({
       endpoint,
       region,
       credentials: {
-        accessKeyId: options.accessKeyId || process.env.S3_ACCESS_KEY_ID,
-        secretAccessKey: options.secretAccessKey || process.env.S3_SECRET_ACCESS_KEY,
+        accessKeyId: options.accessKeyId || process.env.AWS_ACCESS_KEY_ID || process.env.S3_ACCESS_KEY_ID,
+        secretAccessKey: options.secretAccessKey || process.env.AWS_SECRET_ACCESS_KEY || process.env.S3_SECRET_ACCESS_KEY,
       },
       forcePathStyle: true, // Required for most S3-compatible services
     });
