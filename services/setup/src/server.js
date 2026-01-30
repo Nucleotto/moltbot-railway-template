@@ -1,71 +1,37 @@
 /**
- * Moltbot Setup Service
+ * Moltbot Setup Service (S3-backed storage)
  * 
- * This is a lightweight service that:
- * 1. Provides the /setup wizard for initial configuration
- * 2. Runs onboarding commands to configure Moltbot
- * 3. Proxies traffic to the separate Gateway service
- * 
- * Designed for Railway two-service deployment.
+ * This service:
+ * 1. Downloads state from S3 on startup
+ * 2. Provides the /setup wizard for initial configuration
+ * 3. Runs onboarding commands and uploads config to S3
+ * 4. Proxies traffic to the Gateway service
  */
 import childProcess from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 import express from "express";
 import httpProxy from "http-proxy";
 import * as tar from "tar";
+import { initStorage, getStorage } from "../shared/s3-storage.js";
 
-// Railway commonly sets PORT=8080 for HTTP services.
 const PORT = Number.parseInt(process.env.PORT ?? "8080", 10);
-const STATE_DIR =
-  process.env.MOLTBOT_STATE_DIR?.trim() ||
-  path.join(os.homedir(), ".moltbot");
-const WORKSPACE_DIR =
-  process.env.MOLTBOT_WORKSPACE_DIR?.trim() ||
-  path.join(STATE_DIR, "workspace");
 
-// Protect /setup with a user-provided password.
+// Local state directory (ephemeral - synced from S3)
+const STATE_DIR = process.env.MOLTBOT_STATE_DIR?.trim() || "/tmp/moltbot-state/.moltbot";
+const WORKSPACE_DIR = process.env.MOLTBOT_WORKSPACE_DIR?.trim() || "/tmp/moltbot-state/workspace";
+
+// Protect /setup with a user-provided password
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
 
-// Gateway service URL (Railway private networking or public URL)
+// Gateway service URL (Railway private networking)
 const GATEWAY_URL = process.env.GATEWAY_URL?.trim() || "http://gateway:8080";
-const GATEWAY_INTERNAL_PORT = Number.parseInt(
-  process.env.GATEWAY_INTERNAL_PORT ?? "8080",
-  10,
-);
-
-// Gateway admin token - shared with gateway service via env or volume
-function resolveGatewayToken() {
-  const envTok = process.env.MOLTBOT_GATEWAY_TOKEN?.trim();
-  if (envTok) return envTok;
-
-  const tokenPath = path.join(STATE_DIR, "gateway.token");
-  try {
-    const existing = fs.readFileSync(tokenPath, "utf8").trim();
-    if (existing) return existing;
-  } catch {
-    // ignore
-  }
-
-  const generated = crypto.randomBytes(32).toString("hex");
-  try {
-    fs.mkdirSync(STATE_DIR, { recursive: true });
-    fs.writeFileSync(tokenPath, generated, { encoding: "utf8", mode: 0o600 });
-  } catch {
-    // best-effort
-  }
-  return generated;
-}
-
-const MOLTBOT_GATEWAY_TOKEN = resolveGatewayToken();
-process.env.MOLTBOT_GATEWAY_TOKEN = MOLTBOT_GATEWAY_TOKEN;
+const GATEWAY_INTERNAL_PORT = Number.parseInt(process.env.GATEWAY_INTERNAL_PORT ?? "8080", 10);
 
 // CLI for onboarding commands
-const MOLTBOT_ENTRY =
-  process.env.MOLTBOT_ENTRY?.trim() || "/moltbot/dist/entry.js";
+const MOLTBOT_ENTRY = process.env.MOLTBOT_ENTRY?.trim() || "/moltbot/dist/entry.js";
 const MOLTBOT_NODE = process.env.MOLTBOT_NODE?.trim() || "node";
 
 function clawArgs(args) {
@@ -73,10 +39,7 @@ function clawArgs(args) {
 }
 
 function configPath() {
-  return (
-    process.env.MOLTBOT_CONFIG_PATH?.trim() ||
-    path.join(STATE_DIR, "moltbot.json")
-  );
+  return process.env.MOLTBOT_CONFIG_PATH?.trim() || path.join(STATE_DIR, "moltbot.json");
 }
 
 function isConfigured() {
@@ -87,12 +50,49 @@ function isConfigured() {
   }
 }
 
+// Gateway token - read from config or generate
+function resolveGatewayToken() {
+  const envTok = process.env.MOLTBOT_GATEWAY_TOKEN?.trim();
+  if (envTok) return envTok;
+
+  // Try to read from config file
+  try {
+    const config = JSON.parse(fs.readFileSync(configPath(), "utf8"));
+    if (config.gateway?.auth?.token) {
+      return config.gateway.auth.token;
+    }
+  } catch {
+    // Config doesn't exist yet
+  }
+
+  // Fall back to token file (legacy)
+  const tokenPath = path.join(STATE_DIR, "gateway.token");
+  try {
+    const existing = fs.readFileSync(tokenPath, "utf8").trim();
+    if (existing) return existing;
+  } catch {
+    // ignore
+  }
+
+  // Generate new token
+  const generated = crypto.randomBytes(32).toString("hex");
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.writeFileSync(tokenPath, generated, { encoding: "utf8", mode: 0o600 });
+  } catch {
+    // best-effort
+  }
+  return generated;
+}
+
+let MOLTBOT_GATEWAY_TOKEN = null;
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
 async function waitForGatewayReady(opts = {}) {
-  const timeoutMs = opts.timeoutMs ?? 20_000;
+  const timeoutMs = opts.timeoutMs ?? 30_000;
   const start = Date.now();
   const endpoints = ["/moltbot", "/", "/health"];
   
@@ -101,17 +101,17 @@ async function waitForGatewayReady(opts = {}) {
       try {
         const res = await fetch(`${GATEWAY_URL}${endpoint}`, {
           method: "GET",
-          headers: { Authorization: `Bearer ${MOLTBOT_GATEWAY_TOKEN}` },
+          headers: MOLTBOT_GATEWAY_TOKEN ? { Authorization: `Bearer ${MOLTBOT_GATEWAY_TOKEN}` } : {},
         });
         if (res) {
           console.log(`[gateway] ready at ${endpoint}`);
           return true;
         }
-      } catch (err) {
+      } catch {
         // not ready
       }
     }
-    await sleep(250);
+    await sleep(500);
   }
   console.error(`[gateway] failed to become ready after ${timeoutMs}ms`);
   return false;
@@ -122,9 +122,7 @@ function requireSetupAuth(req, res, next) {
     return res
       .status(500)
       .type("text/plain")
-      .send(
-        "SETUP_PASSWORD is not set. Set it in Railway Variables before using /setup.",
-      );
+      .send("SETUP_PASSWORD is not set. Set it in Railway Variables before using /setup.");
   }
 
   const header = req.headers.authorization || "";
@@ -147,14 +145,12 @@ const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
 
-// Minimal health endpoint for Railway.
+// Health endpoint for Railway
 app.get("/setup/healthz", (_req, res) => res.json({ ok: true }));
 
 app.get("/setup/app.js", requireSetupAuth, (_req, res) => {
   res.type("application/javascript");
-  res.send(
-    fs.readFileSync(path.join(process.cwd(), "src", "setup-app.js"), "utf8"),
-  );
+  res.send(fs.readFileSync(path.join(process.cwd(), "src", "setup-app.js"), "utf8"));
 });
 
 app.get("/setup", requireSetupAuth, (_req, res) => {
@@ -177,10 +173,10 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
 </head>
 <body>
   <h1>Moltbot Setup</h1>
-  <p class="muted">This wizard configures Moltbot by running the same onboarding command it uses in the terminal, but from the browser.</p>
+  <p class="muted">This wizard configures Moltbot. Config is stored in S3 and synced to Gateway service.</p>
 
   <div class="info-box">
-    <strong>Two-Service Architecture:</strong> Setup service proxies to Gateway service at <code>${GATEWAY_URL}</code>
+    <strong>S3-Backed Storage:</strong> Config persists in Railway Object Storage. Gateway polls for changes.
   </div>
 
   <div class="card">
@@ -215,19 +211,18 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
 
   <div class="card">
     <h2>2) Optional: Channels</h2>
-    <p class="muted">You can also add channels later inside Moltbot, but this helps you get messaging working immediately.</p>
+    <p class="muted">You can also add channels later inside Moltbot.</p>
 
     <label>Telegram bot token (optional)</label>
     <input id="telegramToken" type="password" placeholder="123456:ABC..." />
     <div class="muted" style="margin-top: 0.25rem">
-      Get it from BotFather: open Telegram, message <code>@BotFather</code>, run <code>/newbot</code>, then copy the token.
+      Get from BotFather: message <code>@BotFather</code>, run <code>/newbot</code>.
     </div>
 
     <label>Discord bot token (optional)</label>
     <input id="discordToken" type="password" placeholder="Bot token" />
     <div class="muted" style="margin-top: 0.25rem">
-      Get it from the Discord Developer Portal: create an application, add a Bot, then copy the Bot Token.<br/>
-      <strong>Important:</strong> Enable <strong>MESSAGE CONTENT INTENT</strong> in Bot → Privileged Gateway Intents, or the bot will crash on startup.
+      Get from Discord Developer Portal. Enable <strong>MESSAGE CONTENT INTENT</strong>.
     </div>
 
     <label>Slack bot token (optional)</label>
@@ -243,7 +238,6 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
     <button id="pairingApprove" style="background:#1f2937; margin-left:0.5rem">Approve pairing</button>
     <button id="reset" style="background:#444; margin-left:0.5rem">Reset setup</button>
     <pre id="log" style="white-space:pre-wrap"></pre>
-    <p class="muted">Reset deletes the Moltbot config file so you can rerun onboarding. Pairing approval lets you grant DM access when dmPolicy=pairing.</p>
   </div>
 
   <script src="/setup/app.js"></script>
@@ -253,112 +247,54 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
 
 app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
   const version = await runCmd(MOLTBOT_NODE, clawArgs(["--version"]));
-  const channelsHelp = await runCmd(
-    MOLTBOT_NODE,
-    clawArgs(["channels", "add", "--help"]),
-  );
+  const channelsHelp = await runCmd(MOLTBOT_NODE, clawArgs(["channels", "add", "--help"]));
 
   const authGroups = [
-    {
-      value: "openai",
-      label: "OpenAI",
-      hint: "Codex OAuth + API key",
-      options: [
-        { value: "codex-cli", label: "OpenAI Codex OAuth (Codex CLI)" },
-        { value: "openai-codex", label: "OpenAI Codex (ChatGPT OAuth)" },
-        { value: "openai-api-key", label: "OpenAI API key" },
-      ],
-    },
-    {
-      value: "anthropic",
-      label: "Anthropic",
-      hint: "Claude Code CLI + API key",
-      options: [
-        { value: "claude-cli", label: "Anthropic token (Claude Code CLI)" },
-        { value: "token", label: "Anthropic token (paste setup-token)" },
-        { value: "apiKey", label: "Anthropic API key" },
-      ],
-    },
-    {
-      value: "google",
-      label: "Google",
-      hint: "Gemini API key + OAuth",
-      options: [
-        { value: "gemini-api-key", label: "Google Gemini API key" },
-        { value: "google-antigravity", label: "Google Antigravity OAuth" },
-        { value: "google-gemini-cli", label: "Google Gemini CLI OAuth" },
-      ],
-    },
-    {
-      value: "openrouter",
-      label: "OpenRouter",
-      hint: "API key",
-      options: [{ value: "openrouter-api-key", label: "OpenRouter API key" }],
-    },
-    {
-      value: "ai-gateway",
-      label: "Vercel AI Gateway",
-      hint: "API key",
-      options: [
-        { value: "ai-gateway-api-key", label: "Vercel AI Gateway API key" },
-      ],
-    },
-    {
-      value: "moonshot",
-      label: "Moonshot AI",
-      hint: "Kimi K2 + Kimi Code",
-      options: [
-        { value: "moonshot-api-key", label: "Moonshot AI API key" },
-        { value: "kimi-code-api-key", label: "Kimi Code API key" },
-      ],
-    },
-    {
-      value: "zai",
-      label: "Z.AI (GLM 4.7)",
-      hint: "API key",
-      options: [{ value: "zai-api-key", label: "Z.AI (GLM 4.7) API key" }],
-    },
-    {
-      value: "minimax",
-      label: "MiniMax",
-      hint: "M2.1 (recommended)",
-      options: [
-        { value: "minimax-api", label: "MiniMax M2.1" },
-        { value: "minimax-api-lightning", label: "MiniMax M2.1 Lightning" },
-      ],
-    },
-    {
-      value: "qwen",
-      label: "Qwen",
-      hint: "OAuth",
-      options: [{ value: "qwen-portal", label: "Qwen OAuth" }],
-    },
-    {
-      value: "copilot",
-      label: "Copilot",
-      hint: "GitHub + local proxy",
-      options: [
-        {
-          value: "github-copilot",
-          label: "GitHub Copilot (GitHub device login)",
-        },
-        { value: "copilot-proxy", label: "Copilot Proxy (local)" },
-      ],
-    },
-    {
-      value: "synthetic",
-      label: "Synthetic",
-      hint: "Anthropic-compatible (multi-model)",
-      options: [{ value: "synthetic-api-key", label: "Synthetic API key" }],
-    },
-    {
-      value: "opencode-zen",
-      label: "OpenCode Zen",
-      hint: "API key",
-      options: [
-        { value: "opencode-zen", label: "OpenCode Zen (multi-model proxy)" },
-      ],
-    },
+    { value: "openai", label: "OpenAI", hint: "Codex OAuth + API key", options: [
+      { value: "codex-cli", label: "OpenAI Codex OAuth (Codex CLI)" },
+      { value: "openai-codex", label: "OpenAI Codex (ChatGPT OAuth)" },
+      { value: "openai-api-key", label: "OpenAI API key" },
+    ]},
+    { value: "anthropic", label: "Anthropic", hint: "Claude Code CLI + API key", options: [
+      { value: "claude-cli", label: "Anthropic token (Claude Code CLI)" },
+      { value: "token", label: "Anthropic token (paste setup-token)" },
+      { value: "apiKey", label: "Anthropic API key" },
+    ]},
+    { value: "google", label: "Google", hint: "Gemini API key + OAuth", options: [
+      { value: "gemini-api-key", label: "Google Gemini API key" },
+      { value: "google-antigravity", label: "Google Antigravity OAuth" },
+      { value: "google-gemini-cli", label: "Google Gemini CLI OAuth" },
+    ]},
+    { value: "openrouter", label: "OpenRouter", hint: "API key", options: [
+      { value: "openrouter-api-key", label: "OpenRouter API key" },
+    ]},
+    { value: "ai-gateway", label: "Vercel AI Gateway", hint: "API key", options: [
+      { value: "ai-gateway-api-key", label: "Vercel AI Gateway API key" },
+    ]},
+    { value: "moonshot", label: "Moonshot AI", hint: "Kimi K2 + Kimi Code", options: [
+      { value: "moonshot-api-key", label: "Moonshot AI API key" },
+      { value: "kimi-code-api-key", label: "Kimi Code API key" },
+    ]},
+    { value: "zai", label: "Z.AI (GLM 4.7)", hint: "API key", options: [
+      { value: "zai-api-key", label: "Z.AI (GLM 4.7) API key" },
+    ]},
+    { value: "minimax", label: "MiniMax", hint: "M2.1", options: [
+      { value: "minimax-api", label: "MiniMax M2.1" },
+      { value: "minimax-api-lightning", label: "MiniMax M2.1 Lightning" },
+    ]},
+    { value: "qwen", label: "Qwen", hint: "OAuth", options: [
+      { value: "qwen-portal", label: "Qwen OAuth" },
+    ]},
+    { value: "copilot", label: "Copilot", hint: "GitHub + local proxy", options: [
+      { value: "github-copilot", label: "GitHub Copilot (GitHub device login)" },
+      { value: "copilot-proxy", label: "Copilot Proxy (local)" },
+    ]},
+    { value: "synthetic", label: "Synthetic", hint: "Anthropic-compatible", options: [
+      { value: "synthetic-api-key", label: "Synthetic API key" },
+    ]},
+    { value: "opencode-zen", label: "OpenCode Zen", hint: "API key", options: [
+      { value: "opencode-zen", label: "OpenCode Zen (multi-model proxy)" },
+    ]},
   ];
 
   // Check gateway connectivity
@@ -388,19 +324,12 @@ function buildOnboardArgs(payload) {
     "--json",
     "--no-install-daemon",
     "--skip-health",
-    "--workspace",
-    WORKSPACE_DIR,
-    // Gateway runs externally, configure it to bind to all interfaces
-    "--gateway-bind",
-    "0.0.0.0",
-    "--gateway-port",
-    String(GATEWAY_INTERNAL_PORT),
-    "--gateway-auth",
-    "token",
-    "--gateway-token",
-    MOLTBOT_GATEWAY_TOKEN,
-    "--flow",
-    payload.flow || "quickstart",
+    "--workspace", WORKSPACE_DIR,
+    "--gateway-bind", "0.0.0.0",
+    "--gateway-port", String(GATEWAY_INTERNAL_PORT),
+    "--gateway-auth", "token",
+    "--gateway-token", MOLTBOT_GATEWAY_TOKEN,
+    "--flow", payload.flow || "quickstart",
   ];
 
   if (payload.authChoice) {
@@ -458,154 +387,111 @@ function runCmd(cmd, args, opts = {}) {
   });
 }
 
+// Upload config to S3 after CLI changes
+async function syncConfigToS3() {
+  try {
+    const storage = getStorage();
+    
+    // Upload moltbot.json
+    await storage.uploadFile(".moltbot/moltbot.json");
+    
+    // Upload gateway.token if it exists
+    const tokenPath = path.join(STATE_DIR, "gateway.token");
+    if (fs.existsSync(tokenPath)) {
+      await storage.uploadFile(".moltbot/gateway.token");
+    }
+    
+    console.log("[s3] Config synced to S3");
+    return true;
+  } catch (err) {
+    console.error("[s3] Failed to sync config to S3:", err.message);
+    return false;
+  }
+}
+
 app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
   try {
     if (isConfigured()) {
       return res.json({
         ok: true,
-        output:
-          "Already configured.\nUse Reset setup if you want to rerun onboarding.\nGateway service should auto-detect the config.\n",
+        output: "Already configured.\nUse Reset setup if you want to rerun onboarding.\n",
       });
     }
 
     fs.mkdirSync(STATE_DIR, { recursive: true });
     fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
 
+    // Resolve token before onboarding
+    MOLTBOT_GATEWAY_TOKEN = resolveGatewayToken();
+
     const payload = req.body || {};
     const onboardArgs = buildOnboardArgs(payload);
     const onboard = await runCmd(MOLTBOT_NODE, clawArgs(onboardArgs));
 
     let extra = "";
-
     const ok = onboard.code === 0 && isConfigured();
 
     if (ok) {
-      // Configure gateway settings in config
+      // Configure gateway settings
       await runCmd(MOLTBOT_NODE, clawArgs(["config", "set", "gateway.mode", "local"]));
-      await runCmd(
-        MOLTBOT_NODE,
-        clawArgs(["config", "set", "gateway.auth.mode", "token"]),
-      );
-      await runCmd(
-        MOLTBOT_NODE,
-        clawArgs([
-          "config",
-          "set",
-          "gateway.auth.token",
-          MOLTBOT_GATEWAY_TOKEN,
-        ]),
-      );
-      await runCmd(
-        MOLTBOT_NODE,
-        clawArgs(["config", "set", "gateway.bind", "0.0.0.0"]),
-      );
-      await runCmd(
-        MOLTBOT_NODE,
-        clawArgs([
-          "config",
-          "set",
-          "gateway.port",
-          String(GATEWAY_INTERNAL_PORT),
-        ]),
-      );
-      await runCmd(
-        MOLTBOT_NODE,
-        clawArgs(["config", "set", "gateway.controlUi.allowInsecureAuth", "true"]),
-      );
+      await runCmd(MOLTBOT_NODE, clawArgs(["config", "set", "gateway.auth.mode", "token"]));
+      await runCmd(MOLTBOT_NODE, clawArgs(["config", "set", "gateway.auth.token", MOLTBOT_GATEWAY_TOKEN]));
+      await runCmd(MOLTBOT_NODE, clawArgs(["config", "set", "gateway.bind", "0.0.0.0"]));
+      await runCmd(MOLTBOT_NODE, clawArgs(["config", "set", "gateway.port", String(GATEWAY_INTERNAL_PORT)]));
+      await runCmd(MOLTBOT_NODE, clawArgs(["config", "set", "gateway.controlUi.allowInsecureAuth", "true"]));
 
-      const channelsHelp = await runCmd(
-        MOLTBOT_NODE,
-        clawArgs(["channels", "add", "--help"]),
-      );
+      const channelsHelp = await runCmd(MOLTBOT_NODE, clawArgs(["channels", "add", "--help"]));
       const helpText = channelsHelp.output || "";
-
       const supports = (name) => helpText.includes(name);
 
-      if (payload.telegramToken?.trim()) {
-        if (!supports("telegram")) {
-          extra +=
-            "\n[telegram] skipped (this moltbot build does not list telegram in `channels add --help`)\n";
-        } else {
-          const token = payload.telegramToken.trim();
-          const cfgObj = {
-            enabled: true,
-            dmPolicy: "pairing",
-            botToken: token,
-            groupPolicy: "allowlist",
-            streamMode: "partial",
-          };
-          const set = await runCmd(
-            MOLTBOT_NODE,
-            clawArgs([
-              "config",
-              "set",
-              "--json",
-              "channels.telegram",
-              JSON.stringify(cfgObj),
-            ]),
-          );
-          extra += `\n[telegram config] exit=${set.code}\n${set.output || "(no output)"}`;
-        }
+      // Add channels if provided
+      if (payload.telegramToken?.trim() && supports("telegram")) {
+        const cfgObj = {
+          enabled: true,
+          dmPolicy: "pairing",
+          botToken: payload.telegramToken.trim(),
+          groupPolicy: "allowlist",
+          streamMode: "partial",
+        };
+        await runCmd(MOLTBOT_NODE, clawArgs(["config", "set", "--json", "channels.telegram", JSON.stringify(cfgObj)]));
+        extra += "\n[telegram] configured\n";
       }
 
-      if (payload.discordToken?.trim()) {
-        if (!supports("discord")) {
-          extra +=
-            "\n[discord] skipped (this moltbot build does not list discord in `channels add --help`)\n";
-        } else {
-          const token = payload.discordToken.trim();
-          const cfgObj = {
-            enabled: true,
-            token,
-            groupPolicy: "allowlist",
-            dm: {
-              policy: "pairing",
-            },
-          };
-          const set = await runCmd(
-            MOLTBOT_NODE,
-            clawArgs([
-              "config",
-              "set",
-              "--json",
-              "channels.discord",
-              JSON.stringify(cfgObj),
-            ]),
-          );
-          extra += `\n[discord config] exit=${set.code}\n${set.output || "(no output)"}`;
-        }
+      if (payload.discordToken?.trim() && supports("discord")) {
+        const cfgObj = {
+          enabled: true,
+          token: payload.discordToken.trim(),
+          groupPolicy: "allowlist",
+          dm: { policy: "pairing" },
+        };
+        await runCmd(MOLTBOT_NODE, clawArgs(["config", "set", "--json", "channels.discord", JSON.stringify(cfgObj)]));
+        extra += "\n[discord] configured\n";
       }
 
-      if (payload.slackBotToken?.trim() || payload.slackAppToken?.trim()) {
-        if (!supports("slack")) {
-          extra +=
-            "\n[slack] skipped (this moltbot build does not list slack in `channels add --help`)\n";
-        } else {
-          const cfgObj = {
-            enabled: true,
-            botToken: payload.slackBotToken?.trim() || undefined,
-            appToken: payload.slackAppToken?.trim() || undefined,
-          };
-          const set = await runCmd(
-            MOLTBOT_NODE,
-            clawArgs([
-              "config",
-              "set",
-              "--json",
-              "channels.slack",
-              JSON.stringify(cfgObj),
-            ]),
-          );
-          extra += `\n[slack config] exit=${set.code}\n${set.output || "(no output)"}`;
-        }
+      if ((payload.slackBotToken?.trim() || payload.slackAppToken?.trim()) && supports("slack")) {
+        const cfgObj = {
+          enabled: true,
+          botToken: payload.slackBotToken?.trim() || undefined,
+          appToken: payload.slackAppToken?.trim() || undefined,
+        };
+        await runCmd(MOLTBOT_NODE, clawArgs(["config", "set", "--json", "channels.slack", JSON.stringify(cfgObj)]));
+        extra += "\n[slack] configured\n";
       }
 
-      extra += "\n\nGateway service should auto-detect the new config and start.\n";
-      extra += `Waiting for gateway at ${GATEWAY_URL}...\n`;
-      
-      // Give the gateway service time to detect config and start
+      // Sync config to S3
+      extra += "\n[s3] Uploading config to S3...\n";
+      const synced = await syncConfigToS3();
+      if (synced) {
+        extra += "[s3] Config uploaded successfully\n";
+        extra += "\nGateway service will detect the new config within 30 seconds.\n";
+      } else {
+        extra += "[s3] Warning: Failed to upload config to S3\n";
+      }
+
+      // Wait for gateway to come up
+      extra += `\nWaiting for gateway at ${GATEWAY_URL}...\n`;
       await sleep(3000);
-      const ready = await waitForGatewayReady({ timeoutMs: 30_000 });
+      const ready = await waitForGatewayReady({ timeoutMs: 60_000 });
       extra += ready ? "Gateway is ready!\n" : "Gateway not responding yet (may still be starting).\n";
     }
 
@@ -615,18 +501,13 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("[/setup/api/run] error:", err);
-    return res
-      .status(500)
-      .json({ ok: false, output: `Internal error: ${String(err)}` });
+    return res.status(500).json({ ok: false, output: `Internal error: ${String(err)}` });
   }
 });
 
 app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
   const v = await runCmd(MOLTBOT_NODE, clawArgs(["--version"]));
-  const help = await runCmd(
-    MOLTBOT_NODE,
-    clawArgs(["channels", "add", "--help"]),
-  );
+  const help = await runCmd(MOLTBOT_NODE, clawArgs(["channels", "add", "--help"]));
   res.json({
     wrapper: {
       node: process.version,
@@ -635,11 +516,8 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
       workspaceDir: WORKSPACE_DIR,
       configPath: configPath(),
       gatewayUrl: GATEWAY_URL,
-      gatewayTokenFromEnv: Boolean(process.env.MOLTBOT_GATEWAY_TOKEN?.trim()),
-      gatewayTokenPersisted: fs.existsSync(
-        path.join(STATE_DIR, "gateway.token"),
-      ),
-      railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || null,
+      s3Bucket: process.env.S3_BUCKET,
+      s3Prefix: process.env.S3_PREFIX,
     },
     moltbot: {
       entry: MOLTBOT_ENTRY,
@@ -653,25 +531,27 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
 app.post("/setup/api/pairing/approve", requireSetupAuth, async (req, res) => {
   const { channel, code } = req.body || {};
   if (!channel || !code) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "Missing channel or code" });
+    return res.status(400).json({ ok: false, error: "Missing channel or code" });
   }
-  const r = await runCmd(
-    MOLTBOT_NODE,
-    clawArgs(["pairing", "approve", String(channel), String(code)]),
-  );
-  return res
-    .status(r.code === 0 ? 200 : 500)
-    .json({ ok: r.code === 0, output: r.output });
+  const r = await runCmd(MOLTBOT_NODE, clawArgs(["pairing", "approve", String(channel), String(code)]));
+  return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: r.output });
 });
 
 app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
   try {
+    // Delete local config
     fs.rmSync(configPath(), { force: true });
-    res
-      .type("text/plain")
-      .send("OK - deleted config file. You can rerun setup now.\nNote: Gateway service will stop until reconfigured.");
+    
+    // Delete from S3
+    try {
+      const storage = getStorage();
+      await storage.deleteFile(".moltbot/moltbot.json");
+      console.log("[s3] Deleted config from S3");
+    } catch (err) {
+      console.error("[s3] Failed to delete config from S3:", err.message);
+    }
+    
+    res.type("text/plain").send("OK - deleted config file locally and from S3. You can rerun setup now.");
   } catch (err) {
     res.status(500).type("text/plain").send(String(err));
   }
@@ -682,37 +562,19 @@ app.get("/setup/export", requireSetupAuth, async (_req, res) => {
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
 
   res.setHeader("content-type", "application/gzip");
-  res.setHeader(
-    "content-disposition",
-    `attachment; filename="moltbot-backup-${new Date().toISOString().replace(/[:.]/g, "-")}.tar.gz"`,
-  );
+  res.setHeader("content-disposition", `attachment; filename="moltbot-backup-${new Date().toISOString().replace(/[:.]/g, "-")}.tar.gz"`);
 
-  const stateAbs = path.resolve(STATE_DIR);
-  const workspaceAbs = path.resolve(WORKSPACE_DIR);
-
-  const dataRoot = "/data";
-  const underData = (p) => p === dataRoot || p.startsWith(dataRoot + path.sep);
-
-  let cwd = "/";
-  let paths = [stateAbs, workspaceAbs].map((p) => p.replace(/^\//, ""));
-
-  if (underData(stateAbs) && underData(workspaceAbs)) {
-    cwd = dataRoot;
-    paths = [
-      path.relative(dataRoot, stateAbs) || ".",
-      path.relative(dataRoot, workspaceAbs) || ".",
-    ];
-  }
-
+  const localRoot = "/tmp/moltbot-state";
+  
   const stream = tar.c(
     {
       gzip: true,
       portable: true,
       noMtime: true,
-      cwd,
+      cwd: localRoot,
       onwarn: () => {},
     },
-    paths,
+    [".moltbot", "workspace"].filter(p => fs.existsSync(path.join(localRoot, p))),
   );
 
   stream.on("error", (err) => {
@@ -735,12 +597,16 @@ proxy.on("error", (err, _req, _res) => {
   console.error("[proxy]", err);
 });
 
-proxy.on("proxyReq", (proxyReq, req, res) => {
-  proxyReq.setHeader("Authorization", `Bearer ${MOLTBOT_GATEWAY_TOKEN}`);
+proxy.on("proxyReq", (proxyReq) => {
+  if (MOLTBOT_GATEWAY_TOKEN) {
+    proxyReq.setHeader("Authorization", `Bearer ${MOLTBOT_GATEWAY_TOKEN}`);
+  }
 });
 
-proxy.on("proxyReqWs", (proxyReq, req, socket, options, head) => {
-  proxyReq.setHeader("Authorization", `Bearer ${MOLTBOT_GATEWAY_TOKEN}`);
+proxy.on("proxyReqWs", (proxyReq) => {
+  if (MOLTBOT_GATEWAY_TOKEN) {
+    proxyReq.setHeader("Authorization", `Bearer ${MOLTBOT_GATEWAY_TOKEN}`);
+  }
 });
 
 app.use(async (req, res) => {
@@ -751,19 +617,44 @@ app.use(async (req, res) => {
   return proxy.web(req, res, { target: GATEWAY_URL });
 });
 
-const server = app.listen(PORT, () => {
-  console.log(`[setup-service] listening on port ${PORT}`);
-  console.log(`[setup-service] setup wizard: http://localhost:${PORT}/setup`);
-  console.log(`[setup-service] configured: ${isConfigured()}`);
-  console.log(`[setup-service] gateway URL: ${GATEWAY_URL}`);
-});
-
-server.on("upgrade", async (req, socket, head) => {
-  if (!isConfigured()) {
-    socket.destroy();
-    return;
+// Main startup
+async function main() {
+  console.log("[setup-service] starting...");
+  
+  // Initialize S3 storage - download all state
+  try {
+    await initStorage({
+      localDir: "/tmp/moltbot-state",
+    });
+  } catch (err) {
+    console.error("[setup-service] S3 init failed:", err.message);
+    console.log("[setup-service] Continuing without S3 state (first run?)");
   }
-  proxy.ws(req, socket, head, { target: GATEWAY_URL });
+  
+  // Resolve token if config exists
+  if (isConfigured()) {
+    MOLTBOT_GATEWAY_TOKEN = resolveGatewayToken();
+  }
+  
+  const server = app.listen(PORT, () => {
+    console.log(`[setup-service] listening on port ${PORT}`);
+    console.log(`[setup-service] setup wizard: http://localhost:${PORT}/setup`);
+    console.log(`[setup-service] configured: ${isConfigured()}`);
+    console.log(`[setup-service] gateway URL: ${GATEWAY_URL}`);
+  });
+
+  server.on("upgrade", async (req, socket, head) => {
+    if (!isConfigured()) {
+      socket.destroy();
+      return;
+    }
+    proxy.ws(req, socket, head, { target: GATEWAY_URL });
+  });
+}
+
+main().catch((err) => {
+  console.error("[setup-service] Fatal error:", err);
+  process.exit(1);
 });
 
 process.on("SIGTERM", () => {

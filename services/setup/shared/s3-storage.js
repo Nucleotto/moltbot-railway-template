@@ -1,0 +1,321 @@
+/**
+ * S3 Storage Module for Moltbot Railway Template
+ * 
+ * Provides sync between local filesystem and S3 bucket.
+ * S3 is the source of truth - local /tmp is ephemeral cache.
+ * 
+ * Usage:
+ *   const storage = new S3Storage({ bucket, prefix, localDir });
+ *   await storage.downloadAll();  // On startup
+ *   await storage.uploadFile('moltbot.json');  // After changes
+ */
+
+import {
+  S3Client,
+  GetObjectCommand,
+  PutObjectCommand,
+  ListObjectsV2Command,
+  HeadObjectCommand,
+  DeleteObjectCommand,
+} from "@aws-sdk/client-s3";
+import fs from "node:fs";
+import path from "node:path";
+import { pipeline } from "node:stream/promises";
+import { Readable } from "node:stream";
+
+export class S3Storage {
+  constructor(options = {}) {
+    this.bucket = options.bucket || process.env.S3_BUCKET;
+    this.prefix = options.prefix || process.env.S3_PREFIX || "moltbot/";
+    this.localDir = options.localDir || process.env.MOLTBOT_STATE_DIR || "/tmp/moltbot-state";
+    
+    // Railway Object Storage uses S3-compatible API
+    const endpoint = options.endpoint || process.env.S3_ENDPOINT;
+    const region = options.region || process.env.S3_REGION || "auto";
+    
+    this.client = new S3Client({
+      endpoint,
+      region,
+      credentials: {
+        accessKeyId: options.accessKeyId || process.env.S3_ACCESS_KEY_ID,
+        secretAccessKey: options.secretAccessKey || process.env.S3_SECRET_ACCESS_KEY,
+      },
+      forcePathStyle: true, // Required for most S3-compatible services
+    });
+    
+    // Ensure prefix ends with /
+    if (this.prefix && !this.prefix.endsWith("/")) {
+      this.prefix += "/";
+    }
+  }
+
+  /**
+   * Get the S3 key for a local file path
+   */
+  getS3Key(localPath) {
+    const relativePath = path.relative(this.localDir, localPath);
+    return this.prefix + relativePath.replace(/\\/g, "/");
+  }
+
+  /**
+   * Get the local path for an S3 key
+   */
+  getLocalPath(s3Key) {
+    const relativePath = s3Key.startsWith(this.prefix) 
+      ? s3Key.slice(this.prefix.length) 
+      : s3Key;
+    return path.join(this.localDir, relativePath);
+  }
+
+  /**
+   * Download all files from S3 to local directory
+   * Called on startup to hydrate local state
+   */
+  async downloadAll() {
+    console.log(`[s3] Downloading all files from s3://${this.bucket}/${this.prefix} to ${this.localDir}`);
+    
+    // Ensure local directory exists
+    fs.mkdirSync(this.localDir, { recursive: true });
+    
+    let continuationToken;
+    let totalFiles = 0;
+    
+    do {
+      const listCommand = new ListObjectsV2Command({
+        Bucket: this.bucket,
+        Prefix: this.prefix,
+        ContinuationToken: continuationToken,
+      });
+      
+      const listResponse = await this.client.send(listCommand);
+      
+      if (listResponse.Contents) {
+        for (const object of listResponse.Contents) {
+          // Skip "directory" markers
+          if (object.Key.endsWith("/")) continue;
+          
+          await this.downloadFile(object.Key);
+          totalFiles++;
+        }
+      }
+      
+      continuationToken = listResponse.NextContinuationToken;
+    } while (continuationToken);
+    
+    console.log(`[s3] Downloaded ${totalFiles} files`);
+    return totalFiles;
+  }
+
+  /**
+   * Download a single file from S3
+   */
+  async downloadFile(s3Key) {
+    const localPath = this.getLocalPath(s3Key);
+    const localDir = path.dirname(localPath);
+    
+    // Ensure directory exists
+    fs.mkdirSync(localDir, { recursive: true });
+    
+    const command = new GetObjectCommand({
+      Bucket: this.bucket,
+      Key: s3Key,
+    });
+    
+    try {
+      const response = await this.client.send(command);
+      const writeStream = fs.createWriteStream(localPath);
+      await pipeline(response.Body, writeStream);
+      console.log(`[s3] Downloaded: ${s3Key} -> ${localPath}`);
+      return true;
+    } catch (err) {
+      if (err.name === "NoSuchKey") {
+        console.log(`[s3] File not found: ${s3Key}`);
+        return false;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Upload a single file to S3
+   * @param {string} relativePath - Path relative to localDir (e.g., "moltbot.json" or ".moltbot/moltbot.json")
+   */
+  async uploadFile(relativePath) {
+    const localPath = path.join(this.localDir, relativePath);
+    const s3Key = this.prefix + relativePath.replace(/\\/g, "/");
+    
+    if (!fs.existsSync(localPath)) {
+      console.log(`[s3] Local file not found: ${localPath}`);
+      return false;
+    }
+    
+    const fileContent = fs.readFileSync(localPath);
+    
+    const command = new PutObjectCommand({
+      Bucket: this.bucket,
+      Key: s3Key,
+      Body: fileContent,
+      ContentType: this.getContentType(localPath),
+    });
+    
+    await this.client.send(command);
+    console.log(`[s3] Uploaded: ${localPath} -> s3://${this.bucket}/${s3Key}`);
+    return true;
+  }
+
+  /**
+   * Upload all files from local directory to S3
+   */
+  async uploadAll() {
+    console.log(`[s3] Uploading all files from ${this.localDir} to s3://${this.bucket}/${this.prefix}`);
+    
+    const files = this.walkDir(this.localDir);
+    let totalFiles = 0;
+    
+    for (const file of files) {
+      const relativePath = path.relative(this.localDir, file);
+      await this.uploadFile(relativePath);
+      totalFiles++;
+    }
+    
+    console.log(`[s3] Uploaded ${totalFiles} files`);
+    return totalFiles;
+  }
+
+  /**
+   * Upload specific directory (e.g., workspace)
+   */
+  async uploadDir(relativeDirPath) {
+    const localDirPath = path.join(this.localDir, relativeDirPath);
+    
+    if (!fs.existsSync(localDirPath)) {
+      console.log(`[s3] Local directory not found: ${localDirPath}`);
+      return 0;
+    }
+    
+    const files = this.walkDir(localDirPath);
+    let totalFiles = 0;
+    
+    for (const file of files) {
+      const relativePath = path.relative(this.localDir, file);
+      await this.uploadFile(relativePath);
+      totalFiles++;
+    }
+    
+    console.log(`[s3] Uploaded ${totalFiles} files from ${relativeDirPath}`);
+    return totalFiles;
+  }
+
+  /**
+   * Check if a file exists in S3
+   */
+  async exists(relativePath) {
+    const s3Key = this.prefix + relativePath.replace(/\\/g, "/");
+    
+    try {
+      await this.client.send(new HeadObjectCommand({
+        Bucket: this.bucket,
+        Key: s3Key,
+      }));
+      return true;
+    } catch (err) {
+      if (err.name === "NotFound" || err.$metadata?.httpStatusCode === 404) {
+        return false;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Delete a file from S3
+   */
+  async deleteFile(relativePath) {
+    const s3Key = this.prefix + relativePath.replace(/\\/g, "/");
+    
+    await this.client.send(new DeleteObjectCommand({
+      Bucket: this.bucket,
+      Key: s3Key,
+    }));
+    
+    console.log(`[s3] Deleted: s3://${this.bucket}/${s3Key}`);
+    return true;
+  }
+
+  /**
+   * Recursively walk a directory and return all file paths
+   */
+  walkDir(dir) {
+    const files = [];
+    
+    if (!fs.existsSync(dir)) return files;
+    
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        files.push(...this.walkDir(fullPath));
+      } else {
+        files.push(fullPath);
+      }
+    }
+    
+    return files;
+  }
+
+  /**
+   * Get content type for a file
+   */
+  getContentType(filePath) {
+    const ext = path.extname(filePath).toLowerCase();
+    const types = {
+      ".json": "application/json",
+      ".txt": "text/plain",
+      ".md": "text/markdown",
+      ".js": "application/javascript",
+      ".ts": "application/typescript",
+      ".yaml": "application/yaml",
+      ".yml": "application/yaml",
+    };
+    return types[ext] || "application/octet-stream";
+  }
+}
+
+/**
+ * Create a singleton storage instance
+ */
+let storageInstance = null;
+
+export function getStorage(options = {}) {
+  if (!storageInstance) {
+    storageInstance = new S3Storage(options);
+  }
+  return storageInstance;
+}
+
+/**
+ * Initialize storage - download all from S3 on startup
+ */
+export async function initStorage(options = {}) {
+  const storage = getStorage(options);
+  
+  try {
+    await storage.downloadAll();
+    console.log("[s3] Storage initialized successfully");
+    return storage;
+  } catch (err) {
+    // If bucket is empty or doesn't exist yet, that's OK for first run
+    if (err.name === "NoSuchBucket") {
+      console.log("[s3] Bucket does not exist yet - will create on first upload");
+      return storage;
+    }
+    if (err.Code === "NoSuchKey" || err.$metadata?.httpStatusCode === 404) {
+      console.log("[s3] No existing state in S3 - starting fresh");
+      return storage;
+    }
+    console.error("[s3] Failed to initialize storage:", err);
+    throw err;
+  }
+}
+
+export default S3Storage;

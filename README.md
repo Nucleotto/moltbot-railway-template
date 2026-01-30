@@ -1,136 +1,165 @@
-# Moltbot Railway Template (Two-Service Architecture)
+# Moltbot Railway Template (S3-Backed Two-Service Architecture)
 
-This repo packages **Moltbot** for Railway with a **two-service architecture** and a **/setup** web wizard so users can deploy and onboard **without running any commands**.
-
-## What you get
-
-- **Moltbot Gateway Service** - Runs the actual Moltbot gateway (scales independently)
-- **Setup/Proxy Service** - Web wizard at `/setup` + proxies traffic to Gateway
-- Persistent state via **Railway Volume** (shared between services)
-- One-click **Export backup** (so users can migrate off Railway later)
+This repo packages **Moltbot** for Railway with a **two-service architecture** using **S3 Object Storage** for persistent state sharing.
 
 ## Architecture
 
 ```
-┌─────────────────┐     ┌─────────────────────┐
-│  Setup Service  │────▶│   Gateway Service   │
-│   (port 8080)   │     │     (port 8080)     │
-│                 │     │                     │
-│  • /setup       │     │  • Moltbot Gateway  │
-│  • Onboarding   │     │  • Control UI       │
-│  • Proxy to GW  │     │  • WebSocket        │
-└────────┬────────┘     └──────────┬──────────┘
-         │                         │
-         └─────────┬───────────────┘
-                   │
-           ┌───────▼───────┐
-           │ Shared Volume │
-           │   (/data)     │
-           └───────────────┘
+┌──────────────────┐                    ┌───────────────────┐
+│  Setup Service   │      proxy         │  Gateway Service  │
+│    (public)      │───────────────────▶│    (internal)     │
+│                  │                    │                   │
+│  • /setup wizard │                    │  • Moltbot Gateway│
+│  • Onboarding CLI│                    │  • Control UI     │
+│  • Proxy to GW   │                    │  • Chat channels  │
+└────────┬─────────┘                    └─────────┬─────────┘
+         │                                        │
+         │  upload config                         │  poll for config
+         │  after setup                           │  every 30s
+         │                                        │
+         └──────────────┬─────────────────────────┘
+                        │
+                        ▼
+               ┌────────────────┐
+               │  S3 Object     │
+               │  Storage       │
+               │                │
+               │  • moltbot.json│
+               │  • workspace/* │
+               │  • tokens      │
+               └────────────────┘
 ```
 
-**Why two services?**
-- **Reliability**: Gateway crashes don't take down setup/proxy
-- **Scaling**: Gateway can scale independently for heavy workloads
-- **Resource isolation**: Better memory/CPU management
-- **Faster deploys**: Changes to setup don't rebuild gateway
+## How It Works
+
+1. **Setup Service** downloads state from S3 on startup
+2. User completes `/setup` wizard → config written locally → uploaded to S3
+3. **Gateway Service** polls S3 every 30 seconds for config changes
+4. Gateway detects new config → starts Moltbot gateway process
+5. All traffic proxied through Setup Service → Gateway Service
+
+**No shared volumes needed** - S3 is the source of truth.
 
 ## Railway Deploy Instructions
 
-### Option A: Deploy as Multi-Service Template
+### Quick Deploy with railway.json
 
-In Railway Template Composer:
+1. Fork this repo
+2. Create new Railway project from repo
+3. Railway will auto-detect `railway.json` and create:
+   - Gateway Service
+   - Setup Service  
+   - Object Storage (S3)
+4. Set `SETUP_PASSWORD` on Setup Service
+5. Enable public networking on Setup Service only
+6. Deploy!
 
-1. Create a new template from this GitHub repo
-2. Add **two services** from the repo:
-   - **Gateway Service**: Root path = `services/gateway`
-   - **Setup Service**: Root path = `services/setup`
-3. Add a **shared Volume** mounted at `/data` for both services
-4. Set environment variables:
+### Manual Setup
 
-**Shared (both services):**
-- `MOLTBOT_STATE_DIR=/data/.moltbot`
-- `MOLTBOT_WORKSPACE_DIR=/data/workspace`
-- `MOLTBOT_GATEWAY_TOKEN` — generate a secret, must be the same for both services
+1. Create Railway project
+2. Add **Object Storage** service (provides S3 bucket)
+3. Add **Gateway Service**:
+   - Source: This repo, root = `services/gateway`
+   - Add S3 env vars (see below)
+4. Add **Setup Service**:
+   - Source: This repo, root = `services/setup`
+   - Add S3 env vars + `GATEWAY_URL`
+   - Enable public networking
 
-**Setup Service only:**
-- `SETUP_PASSWORD` — user-provided password to access `/setup`
-- `GATEWAY_URL=http://gateway.railway.internal:8080` (Railway private networking)
+## Environment Variables
 
-5. Enable **Public Networking** only for Setup Service
-6. Deploy
+### Both Services (S3 Config)
 
-### Option B: Deploy Services Manually
+| Variable | Description |
+|----------|-------------|
+| `S3_BUCKET` | Bucket name from Object Storage |
+| `S3_ENDPOINT` | S3 endpoint URL |
+| `S3_ACCESS_KEY_ID` | Access key |
+| `S3_SECRET_ACCESS_KEY` | Secret key |
+| `S3_REGION` | Region (usually `auto`) |
+| `S3_PREFIX` | Key prefix (default: `moltbot/`) |
 
-1. Create a new Railway project
-2. Add Gateway Service:
-   - New Service → GitHub Repo → Select this repo
-   - Settings → Root Directory: `services/gateway`
-   - Add volume at `/data`
-3. Add Setup Service:
-   - New Service → GitHub Repo → Select this repo
-   - Settings → Root Directory: `services/setup`
-   - Share the same volume at `/data`
-4. Configure variables as above
-5. Enable public networking on Setup Service
+### Setup Service Only
 
-### After Deployment
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `SETUP_PASSWORD` | Yes | Password to access `/setup` |
+| `GATEWAY_URL` | Yes | Internal gateway URL (e.g., `http://gateway.railway.internal:8080`) |
 
-1. Visit `https://<your-setup-service>.up.railway.app/setup`
-2. Complete the setup wizard
-3. Visit `https://<your-setup-service>.up.railway.app/` or `/moltbot`
+### Gateway Service Only
 
-## Getting chat tokens (so you don't have to scramble)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3_SYNC_INTERVAL_MS` | `30000` | How often to check S3 for config changes (ms) |
+| `HEALTH_PORT` | `8081` | Port for health check endpoint |
 
-### Telegram bot token
+## Usage
 
-1. Open Telegram and message **@BotFather**
-2. Run `/newbot` and follow the prompts
-3. BotFather will give you a token that looks like: `123456789:AA...`
-4. Paste that token into `/setup`
+1. Visit `https://<setup-service>.up.railway.app/setup`
+2. Enter setup password
+3. Configure AI provider (API key)
+4. Optionally add Telegram/Discord/Slack bot tokens
+5. Click "Run setup"
+6. Wait for Gateway to detect config (~30 seconds)
+7. Access Moltbot at `/` or `/moltbot`
 
-### Discord bot token
+## Getting Bot Tokens
 
-1. Go to the Discord Developer Portal: https://discord.com/developers/applications
-2. **New Application** → pick a name
-3. Open the **Bot** tab → **Add Bot**
-4. Copy the **Bot Token** and paste it into `/setup`
-5. Invite the bot to your server (OAuth2 URL Generator → scopes: `bot`, `applications.commands`; then choose permissions)
+### Telegram
+1. Message `@BotFather` on Telegram
+2. Run `/newbot`, follow prompts
+3. Copy the token (looks like `123456789:AA...`)
 
-## Local Development with Docker Compose
+### Discord
+1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
+2. New Application → Bot tab → Add Bot
+3. Copy Bot Token
+4. **Enable MESSAGE CONTENT INTENT** under Privileged Gateway Intents
+5. Invite bot via OAuth2 URL Generator (scopes: `bot`, `applications.commands`)
+
+## Local Development
 
 ```bash
-# Build and run both services
+# You'll need to set S3 env vars or use local MinIO
 docker-compose up --build
-
-# Open setup wizard at http://localhost:8080/setup (password: test)
 ```
 
-## Single-Service Mode (Legacy)
+## File Structure
 
-The original single-service deployment is still available in the root `Dockerfile` and `src/` folder. 
-However, the two-service architecture is recommended for production Railway deployments.
+```
+services/
+├── gateway/           # Moltbot gateway runner
+│   ├── Dockerfile
+│   ├── package.json
+│   ├── shared/        # S3 storage module
+│   └── src/
+│       └── server.js
+│
+├── setup/             # Setup wizard + proxy
+│   ├── Dockerfile
+│   ├── package.json
+│   ├── shared/        # S3 storage module
+│   └── src/
+│       ├── server.js
+│       └── setup-app.js
+│
+└── shared/            # Source of truth for shared code
+    └── s3-storage.js
 
-```bash
-# Legacy single-service local test
-docker build -t moltbot-railway-template .
-
-docker run --rm -p 8080:8080 \
-  -e PORT=8080 \
-  -e SETUP_PASSWORD=test \
-  -e MOLTBOT_STATE_DIR=/data/.moltbot \
-  -e MOLTBOT_WORKSPACE_DIR=/data/workspace \
-  -v $(pwd)/.tmpdata:/data \
-  moltbot-railway-template
+railway.json           # Railway service definitions
 ```
 
-## Environment Variables Reference
+## Troubleshooting
 
-| Variable | Service | Required | Description |
-|----------|---------|----------|-------------|
-| `SETUP_PASSWORD` | Setup | Yes | Password to access `/setup` wizard |
-| `MOLTBOT_STATE_DIR` | Both | Recommended | Where Moltbot stores config (`/data/.moltbot`) |
-| `MOLTBOT_WORKSPACE_DIR` | Both | Recommended | Workspace directory (`/data/workspace`) |
-| `MOLTBOT_GATEWAY_TOKEN` | Both | Recommended | Auth token for gateway (generate once, use in both) |
-| `GATEWAY_URL` | Setup | Yes | URL to gateway service (use Railway private networking) |
-| `PORT` | Both | No | HTTP port (default: 8080) |
+**Gateway not starting?**
+- Check S3 credentials are correct
+- Verify config was uploaded: check Setup logs for `[s3] Config uploaded successfully`
+- Gateway polls every 30s - wait or check logs for `[s3] Config changed in S3`
+
+**Setup wizard errors?**
+- Ensure `SETUP_PASSWORD` is set
+- Check S3 bucket exists and is accessible
+
+**Proxy errors after setup?**
+- Verify `GATEWAY_URL` points to correct internal hostname
+- Check Gateway health endpoint: `http://gateway.railway.internal:8081/health`

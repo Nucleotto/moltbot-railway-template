@@ -58,9 +58,14 @@ COPY --from=moltbot-build /moltbot /moltbot
 RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /moltbot/dist/entry.js "$@"' > /usr/local/bin/moltbot \
   && chmod +x /usr/local/bin/moltbot
 
+# Copy shared modules
+COPY shared ./shared
+
 COPY src ./src
 
 ENV PORT=8080
+ENV MOLTBOT_STATE_DIR=/tmp/moltbot-state/.moltbot
+ENV MOLTBOT_WORKSPACE_DIR=/tmp/moltbot-state/workspace
 EXPOSE 8080
 
 CMD ["node", "src/server.js"]
