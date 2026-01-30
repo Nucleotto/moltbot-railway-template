@@ -1,0 +1,12 @@
+[build]
+builder = "dockerfile"
+dockerfilePath = "services/gateway/Dockerfile"
+
+[deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 300
+restartPolicyType = "on_failure"
+
+[variables]
+PORT = "8080"
+HEALTH_PORT = "8081"

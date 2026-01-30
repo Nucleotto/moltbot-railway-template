@@ -1,0 +1,55 @@
+# Docker Compose for local development/testing of the two-service architecture
+# In Railway, each service is deployed separately but shares a volume
+
+services:
+  gateway:
+    build:
+      context: ./services/gateway
+      dockerfile: Dockerfile
+      args:
+        MOLTBOT_GIT_REF: main
+    environment:
+      - PORT=8080
+      - HEALTH_PORT=8081
+      - MOLTBOT_STATE_DIR=/data/.moltbot
+      - MOLTBOT_WORKSPACE_DIR=/data/workspace
+      - MOLTBOT_GATEWAY_TOKEN=${MOLTBOT_GATEWAY_TOKEN:-}
+    volumes:
+      - moltbot-data:/data
+    ports:
+      - "18080:8080"
+      - "18081:8081"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  setup:
+    build:
+      context: ./services/setup
+      dockerfile: Dockerfile
+      args:
+        MOLTBOT_GIT_REF: main
+    environment:
+      - PORT=8080
+      - SETUP_PASSWORD=${SETUP_PASSWORD:-test}
+      - MOLTBOT_STATE_DIR=/data/.moltbot
+      - MOLTBOT_WORKSPACE_DIR=/data/workspace
+      - MOLTBOT_GATEWAY_TOKEN=${MOLTBOT_GATEWAY_TOKEN:-}
+      - GATEWAY_URL=http://gateway:8080
+      - GATEWAY_INTERNAL_PORT=8080
+    volumes:
+      - moltbot-data:/data
+    ports:
+      - "8080:8080"
+    depends_on:
+      - gateway
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/setup/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  moltbot-data:
